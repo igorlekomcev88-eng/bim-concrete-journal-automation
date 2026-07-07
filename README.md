@@ -226,8 +226,8 @@ const message = `✅ Таблица "Журнал бетонных работ п
 
 ## 📞 Контакты
 
-- **Email**: your.email@example.com
-- **Telegram**: @your_telegram
+- Email: kolovrat88.87@mail.ru
+- Telegram: @LekomtsevIgor
 - **LinkedIn**: linkedin.com/in/yourprofile
 
 ---

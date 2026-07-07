@@ -1,0 +1,892 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.sgnl.pro/public/v1/auth/token",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"clientId\": \"YOUR_CLIENT_ID\",\n  \"clientSecret\": \"YOUR_CLIENT_SECRET\",\n  \"scopes\": [\"docs:folder:read\"]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        64,
+        1392
+      ],
+      "name": "Get Token1",
+      "id": "node-id-redacted",
+      "typeVersion": 4.3
+    },
+    {
+      "parameters": {
+        "jsCode": "// === КОНФИГ ===\nconst BASE_URL = 'https://api.sgnl.pro/public/v1';\n\n// Заполните свои значения\nconst CLIENT_ID = \"YOUR_CLIENT_ID\";\nconst CLIENT_SECRET = \"YOUR_CLIENT_SECRET\";\n\n// Что ищем\nconst PROJECT_NAME = $input.first().json.project_name;\nconst FOLDER_NAME_RAW = ($input.first().json.folder_name ?? '').toString();\nconst FILE_NAME_RAW = ($input.first().json.file_name ?? '').toString();\n\n// Нужные скоупы\nconst SCOPES_ARRAY = [\n  'project:read', 'project:list',\n  'docs:folder:read', 'docs:folder:list',\n  'docs:item:read', 'docs:item:list',\n  'docs:version:read', 'docs:version:list',\n  'docs:object:read', 'docs:object:list',\n];\n\n// === УТИЛИТЫ ===\nconst normalize = (s) => (s ?? '').toString().trim();\nconst sameName = (a, b) => normalize(a).toLowerCase() === normalize(b).toLowerCase();\nconst splitPath = (p) =>\n  normalize(p)\n    .replaceAll('\\\\', '/')       // поддержка обратного слеша\n    .split('/')\n    .map((x) => x.trim())\n    .filter(Boolean);\n\n// === HTTP-ОБЁРТКИ ===\nconst httpJsonLenient = async (method, url, { headers = {}, body } = {}) =>\n  await this.helpers.httpRequest({\n    method,\n    url,\n    headers: { accept: 'application/json', ...headers },\n    body,\n    json: true,\n    returnFullResponse: true,\n    ignoreHttpStatusCode: true,\n  });\n\nconst httpJson = async (method, url, { headers = {}, body } = {}) =>\n  await this.helpers.httpRequest({\n    method,\n    url,\n    headers: { accept: 'application/json', ...headers },\n    body,\n    json: true,\n  });\n\n// === АВТОРИЗАЦИЯ СО СКОУПАМИ ===\nconst getToken = async () => {\n  const url = `${BASE_URL}/auth/token`;\n  const res = await httpJsonLenient('POST', url, {\n    body: { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, scopes: SCOPES_ARRAY },\n  });\n  if (!(res.statusCode >= 200 && res.statusCode < 300 && res.body?.token)) {\n    throw new Error(`Auth failed: ${res.statusCode} ${JSON.stringify(res.body || {})}`);\n  }\n  return res.body.token;\n};\n\n// === БИЗНЕС-ЛОГИКА ===\nconst getProjectByName = async (jwt, name) => {\n  const url = `${BASE_URL}/projects`;\n  const res = await httpJson('GET', url, { headers: { Authorization: `Bearer ${jwt}` } });\n  const projects = Array.isArray(res) ? res : res?.projects || res?.data || [];\n  const project = projects.find(p => sameName(p?.name, name));\n  if (!project) throw new Error(`Проект \"${name}\" не найден.`);\n  if (!project.id) throw new Error(`У проекта \"${name}\" отсутствует id.`);\n  return project;\n};\n\nconst getRootFolderId = async (jwt, projectId) => {\n  const url = `${BASE_URL}/docs/projects/${encodeURIComponent(projectId)}`;\n  const res = await httpJson('GET', url, { headers: { Authorization: `Bearer ${jwt}` } });\n  const rootFolderId = res?.rootFolderId || res?.id || res?.folder?.id;\n  if (!rootFolderId) throw new Error('Не удалось определить ID корневой папки документов проекта.');\n  return rootFolderId;\n};\n\nconst listChildFolders = async (jwt, parentFolderId) => {\n  const url = `${BASE_URL}/folders/${encodeURIComponent(parentFolderId)}/children`;\n  const res = await httpJson('GET', url, { headers: { Authorization: `Bearer ${jwt}` } });\n  return Array.isArray(res) ? res : res?.folders || res?.data || [];\n};\n\nconst getChildFolderByName = async (jwt, parentFolderId, folderName) => {\n  const children = await listChildFolders(jwt, parentFolderId);\n  const folder = children.find(f => sameName(f?.name, folderName));\n  if (!folder) throw new Error(`Папка \"${folderName}\" не найдена среди дочерних у ${parentFolderId}.`);\n  if (!folder.id) throw new Error(`У папки \"${folderName}\" отсутствует id.`);\n  return folder;\n};\n\n/**\n * Рекурсивный проход по пути папок:\n * path может быть: \"Папка1/Папка2/Папка3\" или \"Папка1\\\\Папка2\\\\Папка3\"\n * Возвращает объект конечной папки.\n */\nconst getFolderByPath = async (jwt, startFolderId, path) => {\n  const parts = splitPath(path);\n  let currentId = startFolderId;\n  let current = { id: startFolderId };\n\n  for (const part of parts) {\n    current = await getChildFolderByName(jwt, currentId, part);\n    currentId = current.id;\n  }\n  return current;\n};\n\nconst listItemsInFolder = async (jwt, folderId) => {\n  const url = `${BASE_URL}/items?folderId=${encodeURIComponent(folderId)}`;\n  const res = await httpJson('GET', url, { headers: { Authorization: `Bearer ${jwt}` } });\n  return Array.isArray(res) ? res : res?.items || res?.data || [];\n};\n\nconst getItemByName = async (jwt, folderId, fileName) => {\n  const items = await listItemsInFolder(jwt, folderId);\n  const item = items.find(i => sameName(i?.name, fileName));\n  if (!item) {\n    const names = items.map(i => i?.name).filter(Boolean).join(', ');\n    throw new Error(`Файл \"${fileName}\" не найден в папке ${folderId}. Доступные: ${names || 'пусто'}`);\n  }\n  if (!item.id) throw new Error(`У файла \"${fileName}\" отсутствует item.id.`);\n  const versionId = item.topVersionId;\n  if (!versionId) throw new Error(`Не удалось определить versionId для файла \"${fileName}\".`);\n  return { itemId: item.id, versionId, itemName: item.name };\n};\n\nconst getDownloadUrl = async (jwt, itemId, versionId) => {\n  const url = `${BASE_URL}/items/download?itemId=${encodeURIComponent(itemId)}&versionId=${encodeURIComponent(versionId)}`;\n  const res = await httpJson('GET', url, { headers: { Authorization: `Bearer ${jwt}` } });\n  if (!res?.signedUrl) throw new Error('Не удалось получить ссылку на скачивание (signedUrl).');\n  return res.signedUrl;\n};\n\n// === ОСНОВНОЙ БЛОК ===\ntry {\n  const jwt = await getToken();\n  const project = await getProjectByName(jwt, PROJECT_NAME);\n  const rootFolderId = await getRootFolderId(jwt, project.id);\n\n  // Поддерживаем два способа:\n  // 1) folder_name = \"Папка1/Папка2/Папка3\", file_name = \"Файл.docx\"\n  // 2) folder_name = \"\", file_name = \"Папка1/Папка2/Папка3/Файл.docx\"\n  const folderPath = FOLDER_NAME_RAW;\n  const filePathParts = splitPath(FILE_NAME_RAW);\n\n  let targetFolder;\n  let targetFileName;\n\n  if (folderPath) {\n    // Вариант 1: путь папки в FOLDER_NAME_RAW\n    targetFolder = await getFolderByPath(jwt, rootFolderId, folderPath);\n    targetFileName = filePathParts.length > 1\n      ? filePathParts[filePathParts.length - 1] // вдруг в file_name тоже дали путь — берём последний сегмент как имя файла\n      : FILE_NAME_RAW;\n  } else if (filePathParts.length > 1) {\n    // Вариант 2: весь путь вместе с файлом в FILE_NAME_RAW\n    const folderOnlyPath = filePathParts.slice(0, -1).join('/');\n    targetFileName = filePathParts[filePathParts.length - 1];\n    targetFolder = await getFolderByPath(jwt, rootFolderId, folderOnlyPath);\n  } else {\n    // Не дали путь вовсе — ищем файл в корне документов проекта\n    targetFolder = { id: rootFolderId, name: 'root' };\n    targetFileName = FILE_NAME_RAW;\n  }\n\n  const { itemId, versionId, itemName } = await getItemByName(jwt, targetFolder.id, targetFileName);\n  const downloadUrl = await getDownloadUrl(jwt, itemId, versionId);\n  const file = await httpJson('GET', downloadUrl);\n  \n  return [\n    {\n      json: {\n        success: true,\n        projectId: project.id,\n        projectName: project.name,\n        folderId: targetFolder.id,\n        folderPathResolved: folderPath || filePathParts.slice(0, -1).join('/'),\n        fileNameResolved: itemName,\n        itemId,\n        versionId,\n        downloadUrl,\n        file,\n      }\n    },\n  ];\n} catch (e) {\n  return [\n    {\n      json: {\n        success: false,\n        message: e.message || String(e),\n        stack: e.stack || null,\n      },\n    },\n  ];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "DownloadFileFromDocs"
+    },
+    {
+      "parameters": {
+        "options": {
+          "delimiter": ";",
+          "encoding": "utf-8",
+          "enableBOM": true,
+          "relaxQuotes": true,
+          "headerRow": true,
+          "includeEmptyCells": true,
+          "rawData": true,
+          "readAsString": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        928,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "Extract from File1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Берем исходные данные из items\nconst data = items.map(item => item.json);\n\n// Чистим ключи от переносов строк\nconst cleanedData = data.map(row => {\n  const newRow = {};\n  for (const key in row) {\n    const cleanKey = key.replace(/[\\r\\n]/g, ' ').trim();\n    newRow[cleanKey] = row[key];\n  }\n  return newRow;\n});\n\n// Сортируем по дате\ncleanedData.sort((a, b) => {\n  const dateA = a['SIGNAL Completed'] || '';\n  const dateB = b['SIGNAL Completed'] || '';\n  \n  const parseDate = str => {\n    const parts = str.split('.');\n    if (parts.length !== 3) return new Date(0);\n    return new Date(parts[2], parts[1]-1, parts[0]);\n  };\n\n  return parseDate(dateA) - parseDate(dateB);\n});\n\n// Возвращаем для следующего узла\nreturn cleanedData.map(row => ({ json: row }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "Parse & Sort CSV"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.downloadUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer  {{ $json.token }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        704,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "HTTP Request1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Берем исходные данные\nconst data = items.map(item => item.json);\n\n// Функция для парсинга даты в формате ДД.ММ.ГГГГ\nconst parseDate = str => {\n  const [day, month, year] = str.split('.');\n  return new Date(year, month - 1, day);\n};\n\n// Сортируем по дате\ndata.sort((a, b) => parseDate(a['SIGNAL   Completed']) - parseDate(b['SIGNAL   Completed']));\n\n// Возвращаем готовый массив для следующего узла\nreturn data.map(row => ({ json: row }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "Сортировка по дате"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "node-id-redacted",
+              "name": "project_name",
+              "value": "ЖК МЫ поз.6.2",
+              "type": "string"
+            },
+            {
+              "id": "node-id-redacted",
+              "name": "folder_name",
+              "value": "6. СМР/Журнал бетонных работ",
+              "type": "string"
+            },
+            {
+              "id": "node-id-redacted",
+              "name": "file_name",
+              "value": "12.csv",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        272,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "DOCS_CSV"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SPREADSHEET_ID",
+          "mode": "list",
+          "cachedResultName": "Жуонал бетонных работ ",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Лист1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Дата и время укладки бетона": "={{ $json['SIGNAL   Completed'] }}",
+            "Наименование бетонируемой конструкции и ее расположение (оси, отметка)": "={{ $json['Объект   Имя'] }}, {{ $json['Пользовательский   Маркер расположения'] }}, {{ $json['Объект   Отметка низа'] }}, {{ $json['Объект   Отметка верха'] }} {{ $json['Объект   Комментарии'] }} {{ $json[\"Пользовательский   ADSK_Этаж\"] }} {{ $json[\"Пользовательский   Отметка низа\"] }} {{ $json[\"Пользовательский   Отметка верха\"] }}",
+            "Изготовитель (поставщик)\n бетонной\n смеси": "={{ $json['SIGNAL   Contractor'] }}",
+            "Условное\n обозначение бетонной\n смеси и номер\n документа\n о качестве\n по ГОСТ7473": "={{ $json['SIGNAL   Номер партии'] }}",
+            "Объем партии бетонной смеси, уложенной в конструкцию, м3": "={{ $json['Объект   Объем'] }}",
+            "Температура наружного воздуха, 0С": "={{ $json['SIGNAL   Температура'] }}",
+            "Способ и режим твердения бетона": "Естеств. условия",
+            "Проектный класс прочности\n бетона В": "={{ $json['Тип в приложении Revit   Описание'] }}",
+            "row_number": 0,
+            "Подписи ответственных исполнителей работ по бетонированию и контролю качества": "Чепкасов С. А.",
+            "Прочность бетона в промежуточном возрасте при распалубке или\n нагружении конструкций (%Внорм )": "={{ $json['SIGNAL   процент'] }}"
+          },
+          "matchingColumns": [
+            "Наименование бетонируемой конструкции и ее расположение (оси, отметка)"
+          ],
+          "schema": [
+            {
+              "id": "Дата и время укладки бетона",
+              "displayName": "Дата и время укладки бетона",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Наименование бетонируемой конструкции и ее расположение (оси, отметка)",
+              "displayName": "Наименование бетонируемой конструкции и ее расположение (оси, отметка)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Изготовитель (поставщик)\n бетонной\n смеси",
+              "displayName": "Изготовитель (поставщик)\n бетонной\n смеси",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Условное\n обозначение бетонной\n смеси и номер\n документа\n о качестве\n по ГОСТ7473",
+              "displayName": "Условное\n обозначение бетонной\n смеси и номер\n документа\n о качестве\n по ГОСТ7473",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Объем партии бетонной смеси, уложенной в конструкцию, м3",
+              "displayName": "Объем партии бетонной смеси, уложенной в конструкцию, м3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Температура наружного воздуха, 0С",
+              "displayName": "Температура наружного воздуха, 0С",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Способ и режим твердения бетона",
+              "displayName": "Способ и режим твердения бетона",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Проектный класс прочности\n бетона В",
+              "displayName": "Проектный класс прочности\n бетона В",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Прочность бетона в промежуточном возрасте при распалубке или\n нагружении конструкций (%Внорм )",
+              "displayName": "Прочность бетона в промежуточном возрасте при распалубке или\n нагружении конструкций (%Внорм )",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Средняя прочность\n серий контрольных\n образцов бетона (МПа) по результатам\n входного контроля\n прочности бетонной\n смеси по пункту 5.4\n ГОСТ 18105 или по\n примечанию к пункту\n 4.3 ГОСТ 18105",
+              "displayName": "Средняя прочность\n серий контрольных\n образцов бетона (МПа) по результатам\n входного контроля\n прочности бетонной\n смеси по пункту 5.4\n ГОСТ 18105 или по\n примечанию к пункту\n 4.3 ГОСТ 18105",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Подписи ответственных исполнителей работ по бетонированию и контролю качества",
+              "displayName": "Подписи ответственных исполнителей работ по бетонированию и контролю качества",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1584,
+        1392
+      ],
+      "id": "node-id-redacted",
+      "name": "Журнал бетонных работ",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "NczGY7rOAzESS8Kc",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SPREADSHEET_ID",
+          "mode": "list",
+          "cachedResultName": "Журнал ухода за бетоном ",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Лист1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Наименование забетонированной части сооружения": "={{ $json['Объект   Имя'] }} {{ $json['Пользовательский   Маркер расположения'] }} {{ $json['Объект   Отметка верха'] }} {{ $json['Объект   Отметка низа'] }} {{ $json['Объект   Комментарии'] }} {{ $json[\"Пользовательский   ADSK_Этаж\"] }} {{ $json[\"Пользовательский   Отметка низа\"] }} {{ $json[\"Пользовательский   Отметка верха\"] }}",
+            "Дата укладки": "={{ $json['SIGNAL   Completed'] }}",
+            "Объем бетона, м3": "={{ $json['Объект   Объем'] }}",
+            "Метод выдерживания бетона": "Естеств. условия",
+            "Температура бетона при укладке": "='{{ $json['SIGNAL   Температура бетона'] }}",
+            "Температура наружного воздуха": "={{ $json['SIGNAL   Температура'] }}",
+            "Дата и время начала выдерживания бетона": "={{ $json['SIGNAL   Completed'] }}, {{ $json['SIGNAL   Время'] }}",
+            "Продолжительность выдерживания": "3 сут.",
+            "% теоретической прочности от R28": "={{ $json['SIGNAL   процент'] }}",
+            "Ф.И.О ответственного за контроль лица": "Чепкасов С. А. "
+          },
+          "matchingColumns": [
+            "Наименование забетонированной части сооружения"
+          ],
+          "schema": [
+            {
+              "id": "Наименование забетонированной части сооружения",
+              "displayName": "Наименование забетонированной части сооружения",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Дата укладки",
+              "displayName": "Дата укладки",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Объем бетона, м3",
+              "displayName": "Объем бетона, м3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Модуль поверхности, м2/м3",
+              "displayName": "Модуль поверхности, м2/м3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Метод выдерживания бетона",
+              "displayName": "Метод выдерживания бетона",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Температура бетона при укладке",
+              "displayName": "Температура бетона при укладке",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Температура наружного воздуха",
+              "displayName": "Температура наружного воздуха",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Дата и время начала выдерживания бетона",
+              "displayName": "Дата и время начала выдерживания бетона",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Продолжительность выдерживания",
+              "displayName": "Продолжительность выдерживания",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "% теоретической прочности от R28",
+              "displayName": "% теоретической прочности от R28",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Заполняется при электропрогреве",
+              "displayName": "Заполняется при электропрогреве",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "Ф.И.О ответственного за контроль лица",
+              "displayName": "Ф.И.О ответственного за контроль лица",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "примечание",
+              "displayName": "примечание",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1584,
+        1600
+      ],
+      "id": "node-id-redacted",
+      "name": "Журнал ухода за бетоном",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "NczGY7rOAzESS8Kc",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Временный код для отладки\nconst inputData = $input.first().json;\nconsole.log('=== TELEGRAM DEBUG ===');\nconsole.log('Full input:', JSON.stringify(inputData, null, 2));\n\nconst message = inputData.message || inputData;\nconst text = message.text || '';\nconst chatId = message.chat?.id || message.from?.id;\n\nconsole.log('Message:', message);\nconsole.log('Text:', text);\nconsole.log('ChatId:', chatId);\n\n// Всегда запускаем workflow для теста\nreturn [{\n  json: {\n    action: 'run_workflow',\n    chatId: chatId || YOUR_TELEGRAM_CHAT_ID,\n    project_name: 'ЖК МЫ поз.6.2',\n    folder_name: '6. СМР/Журнал бетонных работ',\n    file_name: '12.csv'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        1184
+      ],
+      "id": "node-id-redacted",
+      "name": "Check Command"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "node-id-redacted",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -112,
+        1184
+      ],
+      "id": "node-id-redacted",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -560,
+        1072
+      ],
+      "id": "node-id-redacted",
+      "name": "Telegram Trigger1",
+      "webhookId": "YOUR_WEBHOOK_ID",
+      "credentials": {
+        "telegramApi": {
+          "id": "5oVCWvxLMoRwaWV4",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "Таблица \"Журнал бетонных работ п.6.2\" обновлена ",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2096,
+        1408
+      ],
+      "id": "node-id-redacted",
+      "name": "Send a text message",
+      "webhookId": "YOUR_WEBHOOK_ID",
+      "credentials": {
+        "telegramApi": {
+          "id": "5oVCWvxLMoRwaWV4",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все собранные данные\nconst items = $input.all();\nconst totalCount = items.length;\n\n// Берем первый элемент для примера (если нужны данные)\nconst firstItem = items[0]?.json || {};\n\n// Формируем ОДНО сообщение\nconst message = `✅ Таблица \"Журнал бетонных работ п.6.2\" обновлена\\nОбработано записей: ${totalCount}`;\n\nreturn [{\n  json: {\n    chatId: YOUR_TELEGRAM_CHAT_ID,  // или динамически\n    text: message\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1856,
+        1408
+      ],
+      "id": "node-id-redacted",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Получаем все собранные данные\nconst items = $input.all();\nconst totalCount = items.length;\n\n// Берем первый элемент для примера (если нужны данные)\nconst firstItem = items[0]?.json || {};\n\n// Формируем ОДНО сообщение\nconst message = `✅ Таблица \"Ухода за бетоном п.6.2\" обновлена\\nОбработано записей: ${totalCount}`;\n\nreturn [{\n  json: {\n    chatId: YOUR_TELEGRAM_CHAT_ID,  // или динамически\n    text: message\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        1600
+      ],
+      "id": "node-id-redacted",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "Таблица \"Журнал ухода за бетоном п.6.2\" обновлена ",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2096,
+        1584
+      ],
+      "id": "node-id-redacted",
+      "name": "Send a text message1",
+      "webhookId": "YOUR_WEBHOOK_ID",
+      "credentials": {
+        "telegramApi": {
+          "id": "5oVCWvxLMoRwaWV4",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -304,
+        1840
+      ],
+      "id": "node-id-redacted",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "command": "/home/node/.n8n/venv/bin/python /home/node/.n8n/scripts/google_sheet_to_excel.py --project 6.2"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        1200
+      ],
+      "id": "node-id-redacted",
+      "name": "Execute Command"
+    },
+    {
+      "parameters": {
+        "path": "node-id-redacted",
+        "responseMode": "lastNode",
+        "options": {
+          "responseContentType": "text/html"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -272,
+        1440
+      ],
+      "id": "node-id-redacted",
+      "name": "Webhook",
+      "webhookId": "YOUR_WEBHOOK_ID"
+    }
+  ],
+  "connections": {
+    "Get Token1": {
+      "main": [
+        [
+          {
+            "node": "DOCS_CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DownloadFileFromDocs": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File1": {
+      "main": [
+        [
+          {
+            "node": "Parse & Sort CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Sort CSV": {
+      "main": [
+        [
+          {
+            "node": "Сортировка по дате",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Extract from File1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Сортировка по дате": {
+      "main": [
+        [
+          {
+            "node": "Журнал бетонных работ",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Журнал ухода за бетоном",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DOCS_CSV": {
+      "main": [
+        [
+          {
+            "node": "DownloadFileFromDocs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал бетонных работ": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Execute Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Журнал ухода за бетоном": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Execute Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Command": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Get Token1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger1": {
+      "main": [
+        [
+          {
+            "node": "Check Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a text message": {
+      "main": [
+        []
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Send a text message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get Token1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Get Token1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "YOUR_INSTANCE_ID"
+  },
+  "_description": "BIM Automation Workflow",
+  "_security_note": "All sensitive data redacted"
+}

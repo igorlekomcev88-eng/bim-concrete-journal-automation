@@ -57,6 +57,22 @@
 
 ---
 
+## 📸 Скриншоты
+
+### Workflow в n8n
+![n8n workflow](images/workflow.png)
+
+### Результат — заполненный журнал
+![Google Sheets](images/journal.png)
+
+### Уведомление в Telegram
+![Telegram](images/telegram.png)
+
+### Файлы в Signal Docs (СОД)
+![Signal Docs](images/signal-docs.png)
+
+--- 
+
 ## 🛠 Технологический стек
 
 | Компонент | Технология |

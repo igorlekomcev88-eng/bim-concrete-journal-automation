@@ -236,6 +236,8 @@ const message = `✅ Таблица "Журнал бетонных работ п
 └── docs/
     ├── architecture.png               # Схема архитектуры
     └── signal-api.md                  # Документация по Signal API
+
+---
 ## 📸 Скриншоты
 
 ### Workflow в n8n
@@ -249,10 +251,6 @@ const message = `✅ Таблица "Журнал бетонных работ п
 
 ### Файлы в Signal Docs (СОД)
 ![Signal Docs](images/signal-docs.png)
-```
-
----
-
 ## 📞 Контакты
 
 - **Email**: your.email@example.com
